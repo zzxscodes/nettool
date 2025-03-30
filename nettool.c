@@ -174,7 +174,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state) {
             if (arg) {
                 config_file = strdup(arg);
             } else {
-                config_file = "./conf/rules.conf"; // Assign default path if no argument is provided
+                config_file = "../conf/rules.conf"; // Assign default path if no argument is provided
             }
             break;
         default:
