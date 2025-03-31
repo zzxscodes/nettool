@@ -42,17 +42,26 @@ static __always_inline void populate_sock_key(struct sock_key *key, struct bpf_s
 
 SEC("sockops")
 int sock_map_update(struct bpf_sock_ops *skops) {
-    if (skops->op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB &&
-        skops->op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB) {
+    if (skops->family != AF_INET && skops->family != AF_INET6) {
         return 0;
     }
 
     struct sock_key key = {};
     populate_sock_key(&key, skops);
 
-    if (key.protocol == IPPROTO_TCP || key.protocol == IPPROTO_UDP) {
+    // 处理 TCP主动和被动连接
+    if (skops->op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB ||
+        skops->op == BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB) {
+        if (key.protocol == IPPROTO_TCP) {
+            bpf_sock_hash_update(skops, &sock_map, &key, BPF_ANY);
+        }
+    }
+
+    // 添加对 UDP 的支持
+    if (key.protocol == IPPROTO_UDP) {
         bpf_sock_hash_update(skops, &sock_map, &key, BPF_ANY);
     }
+
     return 0;
 }
 
@@ -144,3 +153,4 @@ int udp_redirect_parser(struct __sk_buff *skb) {
 }
 
 char LICENSE[] SEC("license") = "GPL";
+
