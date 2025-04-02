@@ -26,6 +26,16 @@
 #include "xdpforward.skel.h"
 #include <sys/stat.h>
 #include <fnmatch.h> // Include fnmatch for wildcard matching
+#include <net/if.h>        // For if_nametoindex
+
+#ifndef XDP_FLAGS_DRV_MODE
+#define XDP_FLAGS_DRV_MODE (1U << 2) // Driver mode
+#endif
+
+#ifndef XDP_FLAGS_SKB_MODE
+#define XDP_FLAGS_SKB_MODE (1U << 1) // SKB mode
+#endif
+
 
 #define PERF_BUFFER_PAGES 16
 #define PERF_POLL_TIMEOUT_MS 100
@@ -54,7 +64,9 @@ static char *target_dports = NULL;
 static __u64 targ_min_us = 0;
 static pid_t targ_pid = 0;
 static __u16 target_udp_port = 0; // Updated to use __u16
-static char *config_file = "../conf/rules.conf"; // Default config file path
+static char *config_file = "./conf/rules.conf"; // Default config file path
+static char *xdp_iface = NULL; // Interface to attach XDP program
+static char *xdp_mode = "skb"; // Default XDP mode (skb or native)
 
 const char *tcp_states[] = {
     [1] = "ESTABLISHED", [2] = "SYN_SENT",   [3] = "SYN_RECV",
@@ -92,7 +104,9 @@ const char argp_program_doc[] =
     "    --min=MINUS             Minimum latency in microseconds (tcpconnlat mode)\n"
     "    --pid=PID               Trace specific PID (tcpconnlat mode)\n"
     "    --udpport=PORT          Trace specific UDP port (udpbandwidth and udpcongest modes)\n"
-    "    -c, --conf=FILE         Path to configuration file for xdpforward mode (default: ./conf/rules.conf)\n";
+    "    -c, --conf=FILE         Path to configuration file for xdpforward mode (default: ./conf/rules.conf)\n"
+    "    -i, --iface=IFACE       Network interface to attach XDP program (xdpforward mode)\n"
+    "    --xdp-mode=MODE         XDP mode: 'skb' (default) or 'native' (xdpforward mode)\n";
 
 static const struct argp_option opts[] = {
     {"mode", 'm', "MODE", 0, "Set the tool mode (tcpstates, tcprtt, tcpconnlat, udpbandwidth, udpcongest, sockredirect, or xdpforward)"},
@@ -108,6 +122,8 @@ static const struct argp_option opts[] = {
     {"pid", 'p', "PID", 0, "Trace specific PID (tcpconnlat mode)"}, // Updated with short option -p
     {"udpport", 'u', "PORT", 0, "Trace specific UDP port (udpbandwidth and udpcongest modes)"}, // Updated with short option -u
     {"conf", 'c', "FILE", OPTION_ARG_OPTIONAL, "Path to configuration file for xdpforward mode (default: ./conf/rules.conf)"},
+    {"iface", 'i', "IFACE", 0, "Network interface to attach XDP program (xdpforward mode)"},
+    {"xdp-mode", 4, "MODE", 0, "XDP mode: 'skb' (default) or 'native' (xdpforward mode)"},
     {NULL, 0, NULL, 0, NULL}, // Removed --sockmap
 };
 
@@ -174,7 +190,18 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state) {
             if (arg) {
                 config_file = strdup(arg);
             } else {
-                config_file = "../conf/rules.conf"; // Assign default path if no argument is provided
+                config_file = "./conf/rules.conf"; // Assign default path if no argument is provided
+            }
+            break;
+        case 'i': // Handle -i or --iface
+            xdp_iface = strdup(arg);
+            break;
+        case 4: // Handle --xdp-mode
+            if (strcmp(arg, "skb") == 0 || strcmp(arg, "native") == 0) {
+                xdp_mode = strdup(arg);
+            } else {
+                warn("Invalid XDP mode: %s. Use 'skb' or 'native'.\n", arg);
+                argp_usage(state);
             }
             break;
         default:
@@ -555,6 +582,24 @@ static void manage_xdpforward_rules(int map_fd) {
     }
 }
 
+static int attach_xdp_program(int prog_fd, const char *iface, const char *mode) {
+    int flags = (strcmp(mode, "native") == 0) ? XDP_FLAGS_DRV_MODE : XDP_FLAGS_SKB_MODE;
+    int ifindex = if_nametoindex(iface);
+    if (ifindex == 0) {
+        fprintf(stderr, "Failed to get interface index for %s: %s\n", iface, strerror(errno));
+        return -1;
+    }
+
+    int err = bpf_xdp_attach(ifindex, prog_fd, flags, NULL); // Use bpf_xdp_attach
+    if (err < 0) {
+        fprintf(stderr, "Failed to attach XDP program to %s: %s\n", iface, strerror(-err));
+        return -1;
+    }
+
+    printf("XDP program attached to interface %s in %s mode.\n", iface, mode);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     LIBBPF_OPTS(bpf_object_open_opts, open_opts);
     static const struct argp argp = {
@@ -854,8 +899,14 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        if (xdpforward_bpf__attach(obj)) {
-            warn("Failed to attach xdpforward BPF programs\n");
+        if (xdp_iface == NULL) {
+            fprintf(stderr, "No interface specified for XDP program. Use -i or --iface to specify.\n");
+            xdpforward_bpf__destroy(obj);
+            close(map_fd);
+            return 1;
+        }
+
+        if (attach_xdp_program(bpf_program__fd(obj->progs.xdp_forward), xdp_iface, xdp_mode) != 0) {
             xdpforward_bpf__destroy(obj);
             close(map_fd);
             return 1;
@@ -870,3 +921,4 @@ int main(int argc, char **argv) {
 
     return err != 0;
 }
+
